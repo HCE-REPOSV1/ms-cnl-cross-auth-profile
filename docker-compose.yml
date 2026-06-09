@@ -1,19 +1,27 @@
-# docker-compose.yml — aa-pruebas-auth
-# Uso: docker compose up -d  |  docker compose down  |  docker compose build
+# docker-compose.yml — aa-pruebas-auth (producción)
+# Uso: docker compose up -d
+#
+# Los secretos se cargan desde Vault al arrancar.
+# VAULT_TOKEN vive en .env.docker (una sola línea, nunca commitear).
+# Actualizar .env.docker cuando se regeneren tokens con vault-init.
 
 services:
   aa-pruebas-auth:
     build: .
+    env_file:
+      - .env.docker
     ports:
-      - "${PORT:-10402}:${PORT:-10402}"
-    env_file: .env
+      - "10402:10402"
     environment:
       NODE_ENV: production
+      PORT: "10402"
+      VAULT_ADDR: "http://host.docker.internal:8200"
+      VAULT_SECRET_PATH: "hce/nestjs/auth-service"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:${PORT:-10402}/auth/health || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://localhost:10402/auth/health || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3

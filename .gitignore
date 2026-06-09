@@ -2,5 +2,9 @@ node_modules/
 dist/
 .env
 .env.local
+.env.docker
 build/
 coverage/
+# Claude Code
+.claude/
+CLAUDE.md

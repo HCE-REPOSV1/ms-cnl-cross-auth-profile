@@ -88,11 +88,88 @@ El servicio delega autenticación y accesos al sistema MAC:
 | 9 | Usuario deshabilitado en AD | 403 |
 | 99 | Error interno MAC | 503 |
 
-## Instalación
+## Cómo ejecutar
+
+### Local sin Docker
 
 ```bash
 npm install
-cp .env.example .env
-# Completar EXTERNAL_AUTH_BASE_URL, JWT_SECRET, CRYPTO_KEY, CRYPTO_IV
+# Copiar .env.example a .env y completar EXTERNAL_AUTH_BASE_URL, JWT_SECRET, CRYPTO_KEY, CRYPTO_IV
 npm run start:dev
+```
+
+Swagger disponible en `http://localhost:10402/api/docs` (solo fuera de producción).
+
+### Local con Docker
+
+Usa `docker-compose.dev.yml`, que lee el `.env` local:
+
+```bash
+docker compose -f docker-compose.dev.yml build
+docker compose -f docker-compose.dev.yml up -d
+
+# O build + up en un solo comando:
+docker compose -f docker-compose.dev.yml up -d --build
+
+# Para bajar:
+docker compose -f docker-compose.dev.yml down
+```
+
+### Producción (con Vault)
+
+El `docker-compose.yml` lee los secretos directamente de Vault al arrancar. **No se necesita `.env`.**
+
+**Requisito:** Vault corriendo (ver [HCE-vault-config](../HCE-vault-config/README.md)).
+
+#### Paso 1 — Obtener el token
+
+El archivo `HCE-vault-config/.env` tiene la línea:
+```
+TOKEN_AUTH_SERVICE=hvs.CAESIDsn...
+```
+Copia ese valor.
+
+#### Paso 2 — Crear `.env.docker` con el token
+
+Este archivo tiene **una sola línea** con el token de bootstrap. No contiene secretos de la app — esos vienen del vault.
+
+**PowerShell (Windows):**
+```powershell
+"VAULT_TOKEN=hvs.CAESIDsn..." | Out-File -Encoding utf8 .env.docker
+```
+
+**Bash / Linux / Mac:**
+```bash
+echo "VAULT_TOKEN=hvs.CAESIDsn..." > .env.docker
+```
+
+> `.env.docker` está en `.gitignore` — nunca se commitea.  
+> Si el init regenera los tokens, actualizar este archivo con el nuevo valor de `TOKEN_AUTH_SERVICE`.
+
+#### Paso 3 — Levantar
+
+```bash
+docker compose down
+docker compose build
+docker compose up -d
+```
+
+Funciona igual en PowerShell, CMD y bash — sin exportar nada.
+
+Al arrancar, `entrypoint.sh` se conecta al Vault con ese token, descarga todos los secretos
+(`JWT_SECRET`, `CRYPTO_KEY`, `EXTERNAL_AUTH_BASE_URL`, etc.) y los inyecta como variables de
+entorno en el contenedor. La aplicación no sabe que existe Vault.
+
+Con GitHub Actions el token se pasa automáticamente desde GitHub Secrets (`VAULT_TOKEN`).
+
+---
+
+## Scripts disponibles
+
+```bash
+npm run start:dev   # desarrollo con hot-reload
+npm run build       # compilar TypeScript
+npm run start:prod  # ejecutar build
+npm run test        # tests unitarios
+npm run test:cov    # cobertura
 ```

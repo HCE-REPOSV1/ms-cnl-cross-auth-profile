@@ -13,7 +13,9 @@ RUN addgroup -S nestjs && adduser -S nestjs -G nestjs
 COPY package*.json ./
 RUN npm ci --only=production
 COPY --from=builder /app/dist ./dist
+COPY entrypoint.sh ./entrypoint.sh
+RUN chmod +x entrypoint.sh
 EXPOSE ${PORT:-10402}
 USER nestjs
 HEALTHCHECK --interval=30s --timeout=5s CMD wget -qO- http://localhost:${PORT:-10402}/auth/health || exit 1
-CMD ["node", "dist/main"]
+CMD ["sh", "entrypoint.sh"]
