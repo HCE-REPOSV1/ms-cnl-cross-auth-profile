@@ -4,13 +4,8 @@
     "target": "ES2021",
     "strict": true,
     "outDir": "./dist",
-    "baseUrl": "./",
+    "rootDir": "./src",
     "experimentalDecorators": true,
-    "emitDecoratorMetadata": true,
-    "paths": {
-      "@/*": [
-        "src/*"
-      ]
-    }
+    "emitDecoratorMetadata": true
   }
 }

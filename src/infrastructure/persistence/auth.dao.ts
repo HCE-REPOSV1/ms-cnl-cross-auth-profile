@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import type { UserInfo } from './user-info.interface';
+import type { UserInfo } from '../../domain/models/user-info.interface';
 
 // Autenticación local contra variables de entorno.
 // Reemplazar por ExternalAuthDao para delegar a un servicio externo (MAC, LDAP, etc.)

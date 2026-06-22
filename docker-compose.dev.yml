@@ -1,14 +1,14 @@
-# docker-compose.dev.yml — aa-pruebas-auth (desarrollo local con Docker)
+# docker-compose.dev.yml — ms-cnl-cross-auth-profile (desarrollo local con Docker)
 # Uso: docker compose -f docker-compose.dev.yml up -d
 #
 # Lee las variables directamente del .env local.
 # Para desarrollo sin Docker usa: npm run start:dev
 
 services:
-  aa-pruebas-auth:
+  ms-cnl-cross-auth-profile:
     build: .
     ports:
-      - "${PORT:-10402}:${PORT:-10402}"
+      - "${PORT:-10701}:${PORT:-10701}"
     env_file: .env
     environment:
       NODE_ENV: development

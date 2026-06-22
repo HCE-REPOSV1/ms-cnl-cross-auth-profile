@@ -1,0 +1,8 @@
+# Forzar LF para que los scripts funcionen en Linux
+*.sh    text eol=lf
+*.hcl   text eol=lf
+*.env*  text eol=lf
+*.json  text eol=lf
+*.ts    text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf

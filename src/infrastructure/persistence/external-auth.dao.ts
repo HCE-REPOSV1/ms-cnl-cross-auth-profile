@@ -11,7 +11,8 @@ import { HttpService } from '@nestjs/axios';
 import { firstValueFrom, timeout, TimeoutError } from 'rxjs';
 import * as https from 'https';
 import { createCipheriv } from 'crypto';
-import type { UserInfo, Sucursal } from './user-info.interface';
+import type { UserInfo, Sucursal } from '../../domain/models/user-info.interface';
+import { MacTokenExpiredException } from '../../domain/exceptions/mac-token-expired.exception';
 
 /**
  * ExternalAuthDao — integración con MAC (Módulo de Autenticación Centralizado)
@@ -113,40 +114,86 @@ export class ExternalAuthDao {
   }
 
   async getAccesos(macToken: string, codigoPerfil: string): Promise<any> {
-    const res = await firstValueFrom(
-      this.http.post(
-        `${this.baseUrl}/obtenerAccesos`,
-        { codigoSistema: this.config.get<string>('EXTERNAL_AUTH_SISTEMA', '25'), codigoPerfil },
-        { httpsAgent: this.httpsAgent, headers: { Authorization: `bearer ${macToken}` } },
-      ).pipe(timeout({ each: this.TIMEOUT_MS })),
-    );
-    return res.data;
+    try {
+      const res = await firstValueFrom(
+        this.http.post(
+          `${this.baseUrl}/obtenerAccesos`,
+          { codigoSistema: this.config.get<string>('EXTERNAL_AUTH_SISTEMA', '25'), codigoPerfil },
+          { httpsAgent: this.httpsAgent, headers: { Authorization: `bearer ${macToken}` } },
+        ).pipe(timeout({ each: this.TIMEOUT_MS })),
+      );
+      return res.data;
+    } catch (err: any) {
+      // codigo=3 ("El token ya caducó") es el único documentado para este endpoint.
+      throw this.mapMacBodyError(err, 'obtenerAccesos', [3]);
+    }
   }
 
   async cerrarSesion(macToken: string, codigoUsuario: string): Promise<any> {
-    const res = await firstValueFrom(
-      this.http.post(
-        `${this.baseUrl}/cerrarSesion`,
-        { codigoUsuario },
-        { httpsAgent: this.httpsAgent, headers: { Authorization: `bearer ${macToken}` } },
-      ).pipe(timeout({ each: this.TIMEOUT_MS })),
-    );
-    return res.data;
+    try {
+      const res = await firstValueFrom(
+        this.http.post(
+          `${this.baseUrl}/cerrarSesion`,
+          { codigoUsuario },
+          { httpsAgent: this.httpsAgent, headers: { Authorization: `bearer ${macToken}` } },
+        ).pipe(timeout({ each: this.TIMEOUT_MS })),
+      );
+      return res.data;
+    } catch (err: any) {
+      // Documentado como "Autenticación: No requerida (Anonymous)" — no hay código de
+      // token caducado aquí (codigo=2 es "el token no corresponde al usuario", no expiry).
+      throw this.mapMacBodyError(err, 'cerrarSesion', []);
+    }
   }
 
   async cambiarContrasena(macToken: string, codigoUsuario: string, actualContrasena: string, nuevaContrasena: string): Promise<any> {
-    const res = await firstValueFrom(
-      this.http.post(
-        `${this.baseUrl}/cambioContrasena`,
-        {
-          codigoUsuario,
-          actualContrasena: this.macEncrypt(actualContrasena),
-          nuevaContrasena:  this.macEncrypt(nuevaContrasena),
-        },
-        { httpsAgent: this.httpsAgent, headers: { Authorization: `bearer ${macToken}` } },
-      ).pipe(timeout({ each: this.TIMEOUT_MS })),
-    );
-    return res.data;
+    try {
+      const res = await firstValueFrom(
+        this.http.post(
+          `${this.baseUrl}/cambioContrasena`,
+          {
+            codigoUsuario,
+            actualContrasena: this.macEncrypt(actualContrasena),
+            nuevaContrasena:  this.macEncrypt(nuevaContrasena),
+          },
+          { httpsAgent: this.httpsAgent, headers: { Authorization: `bearer ${macToken}` } },
+        ).pipe(timeout({ each: this.TIMEOUT_MS })),
+      );
+      return res.data;
+    } catch (err: any) {
+      // Sin código de token caducado documentado para este endpoint tampoco.
+      throw this.mapMacBodyError(err, 'cambioContrasena', []);
+    }
+  }
+
+  /**
+   * MAC señaliza errores con su propio `codigo` dentro del body JSON, no con el status
+   * HTTP (confirmado en vivo: firma de token inválida → HTTP 400 + {codigo:99}; éxito →
+   * HTTP 200 + {codigo:0}). El status HTTP varía según el caso pero siempre viaja un
+   * `codigo` de negocio cuando MAC responde (a diferencia de timeouts/red, que no traen
+   * `response.data` en absoluto — esos se relanzan tal cual para el manejo genérico).
+   *
+   * `expiredCodes`: códigos de ESTE endpoint que documentadamente significan "token
+   * caducado" (MAC no tiene refresh propio, por eso eso siempre implica login nuevo).
+   */
+  private mapMacBodyError(err: any, endpoint: string, expiredCodes: number[]): Error {
+    if (err?.response?.status === 404) {
+      this.logger.error(`MAC ${endpoint} not found (404) — verificar EXTERNAL_AUTH_BASE_URL o que el endpoint exista en este ambiente`);
+      return new ServiceUnavailableException(`Servicio de autenticación mal configurado (${endpoint} no encontrado)`);
+    }
+
+    const body = err?.response?.data;
+    if (!body || typeof body.codigo === 'undefined') return err; // timeout/red, no es error de negocio de MAC
+
+    const codigo  = Number(body.codigo);
+    const mensaje = body.mensaje ?? '';
+
+    if (expiredCodes.includes(codigo)) {
+      this.logger.warn(`MAC ${endpoint}: token caducado (codigo=${codigo})`);
+      return new MacTokenExpiredException();
+    }
+    this.logger.warn(`MAC ${endpoint} error: codigo=${codigo} mensaje=${mensaje}`);
+    return new HttpException({ codigo, mensaje }, HttpStatus.BAD_REQUEST);
   }
 
   /**

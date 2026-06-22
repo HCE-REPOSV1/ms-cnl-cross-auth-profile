@@ -1,13 +1,14 @@
-import { Injectable, UnauthorizedException, ForbiddenException, HttpException, Inject } from '@nestjs/common';
+import { Injectable, UnauthorizedException, HttpException, Inject } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import { randomUUID } from 'crypto';
-import { AUTH_DAO, IAuthDao, MAC_DAO, IMacAuthDao } from './auth-dao.interface';
-import { MacTokenCacheService } from './mac-token-cache.service';
+import { AUTH_DAO, IAuthDao, MAC_DAO, IMacAuthDao } from '../../domain/repositories/auth-dao.interface';
+import { MacTokenCacheService } from '../../infrastructure/cache/mac-token-cache.service';
 import { KafkaLoggerService } from '../../logger/kafka-logger.service';
+import { MacTokenExpiredException } from '../../domain/exceptions/mac-token-expired.exception';
 
 @Injectable()
-export class AuthService {
+export class AuthUseCase {
   constructor(
     private readonly jwt:         JwtService,
     private readonly config:      ConfigService,
@@ -24,9 +25,9 @@ export class AuthService {
       const user = await this.authDao.validateUser(username, password);
       if (!user) {
         await this.kafkaLogger.log({
-          event_type: 'LOGIN_FAILED', level: 'WARN', trace_id: attemptTraceId,
-          username, action: 'LOGIN', outcome: 'FAILED', reason: 'INVALID_CREDENTIALS',
-          ip_address: context?.ip, user_agent: context?.userAgent,
+          eventType: 'LOGIN_FAILED', level: 'WARN', traceId: attemptTraceId,
+          username, action: 'LOGIN', outcome: 'FAILED', payload: { reason: 'INVALID_CREDENTIALS' },
+          ipAddress: context?.ip, userAgent: context?.userAgent,
         });
         throw new UnauthorizedException('Credenciales inválidas');
       }
@@ -55,13 +56,14 @@ export class AuthService {
         sucursales:      user.sucursales      ?? [],
       };
 
-      const accessToken = this.jwt.sign(payload);
+      const accessToken  = this.jwt.sign(payload);
+      const refreshToken = this.signRefreshToken(payload);
 
       await this.kafkaLogger.log({
-        event_type: 'LOGIN_SUCCESS', level: 'INFO', trace_id: attemptTraceId,
-        user_id: user.userId, username: user.username, session_id: sessionId,
+        eventType: 'LOGIN_SUCCESS', level: 'INFO', traceId: attemptTraceId,
+        userId: user.userId, username: user.username, sessionId,
         action: 'LOGIN', outcome: 'SUCCESS',
-        ip_address: context?.ip, user_agent: context?.userAgent,
+        ipAddress: context?.ip, userAgent: context?.userAgent,
       });
 
       return {
@@ -70,6 +72,9 @@ export class AuthService {
         data: {
           user:                 { userId: user.userId, username: user.username, roles: user.roles, email: user.email, sucursales: user.sucursales ?? [] },
           access_token:         accessToken,
+          // refresh_token solo viaja como cookie httpOnly (ver AuthController.setCookies) —
+          // se incluye aquí para que el controller la lea, pero nunca debe llegar al body de la respuesta.
+          refresh_token:        refreshToken,
           expires_in:           this.config.get<string>('JWT_EXPIRES_IN', '4h'),
           token_type:           'Bearer',
           session_id:           sessionId,
@@ -77,19 +82,25 @@ export class AuthService {
         },
       };
     } catch (err) {
-      if (err instanceof HttpException) throw err;   // cubre UnauthorizedException y ForbiddenException
-      if (err instanceof ForbiddenException) {
+      // ExternalAuthDao.mapUser() lanza HttpException directamente para casos de
+      // negocio (usuario no existe, credenciales inválidas, bloqueado, deshabilitado)
+      // en vez de retornar null — por eso el logging debe hacerse aquí, no en el
+      // branch `if (!user)` de arriba (que en la práctica nunca se alcanza).
+      if (err instanceof HttpException) {
+        const status   = err.getStatus();
+        const blocked   = status === 403;
+        const reason    = (err.getResponse() as any)?.mensaje ?? err.message;
         await this.kafkaLogger.log({
-          event_type: 'LOGIN_BLOCKED', level: 'WARN', trace_id: attemptTraceId,
-          username, action: 'LOGIN', outcome: 'BLOCKED', reason: 'USER_BLOCKED',
-          ip_address: context?.ip, user_agent: context?.userAgent,
+          eventType: blocked ? 'LOGIN_BLOCKED' : 'LOGIN_FAILED', level: 'WARN', traceId: attemptTraceId,
+          username, action: 'LOGIN', outcome: blocked ? 'BLOCKED' : 'FAILED', payload: { reason },
+          ipAddress: context?.ip, userAgent: context?.userAgent,
         });
         throw err;
       }
       await this.kafkaLogger.log({
-        event_type: 'LOGIN_FAILED', level: 'ERROR', trace_id: attemptTraceId,
-        username, action: 'LOGIN', outcome: 'ERROR', reason: (err as any)?.message,
-        ip_address: context?.ip, user_agent: context?.userAgent,
+        eventType: 'LOGIN_FAILED', level: 'ERROR', traceId: attemptTraceId,
+        username, action: 'LOGIN', outcome: 'ERROR', payload: { reason: (err as any)?.message },
+        ipAddress: context?.ip, userAgent: context?.userAgent,
       });
       throw err;
     }
@@ -121,13 +132,63 @@ export class AuthService {
   async getAccesos(user: any) {
     const cached = this.macCache.get(user.sessionId);
     if (!cached) throw new UnauthorizedException('Sesión MAC no encontrada o expirada');
-    const raw      = await this.macDao.getAccesos(cached.macToken, cached.perfil);
-    const opciones = raw?.data?.opciones ?? [];
+    try {
+      const raw      = await this.macDao.getAccesos(cached.macToken, cached.perfil);
+      const opciones = raw?.data?.opciones ?? [];
+      return {
+        success: true,
+        data: {
+          opciones,
+          permisos: this.flattenOpciones(opciones),
+        },
+      };
+    } catch (err) {
+      if (err instanceof MacTokenExpiredException) this.macCache.delete(user.sessionId);
+      throw err;
+    }
+  }
+
+  /**
+   * Firma un JWT de refresh, vida más larga y secret propio (JWT_REFRESH_SECRET)
+   * — así un access_token filtrado no sirve para pedir refresh, y viceversa.
+   */
+  private signRefreshToken(payload: Record<string, any>): string {
+    return this.jwt.sign(
+      { ...payload, type: 'refresh' },
+      {
+        secret:    this.config.get<string>('JWT_REFRESH_SECRET'),
+        expiresIn: this.config.get<string>('JWT_REFRESH_EXPIRES_IN', '7d') as any,
+      },
+    );
+  }
+
+  /**
+   * Reemite access_token + refresh_token (rotación) a partir de un refresh_token válido.
+   * No revalida contra MAC ni extiende el macCache — si la sesión MAC ya expiró,
+   * getAccesos/cambiarContrasena seguirán fallando hasta un login nuevo (ver diseño en memoria).
+   */
+  async refreshAccessToken(refreshToken: string) {
+    let decoded: any;
+    try {
+      decoded = this.jwt.verify(refreshToken, { secret: this.config.get<string>('JWT_REFRESH_SECRET') });
+    } catch {
+      throw new UnauthorizedException('Refresh token inválido o expirado');
+    }
+    if (decoded?.type !== 'refresh') throw new UnauthorizedException('Token no es de tipo refresh');
+
+    const { type, iat, exp, ...payload } = decoded;
+    const accessToken     = this.jwt.sign(payload);
+    const newRefreshToken = this.signRefreshToken(payload);
+
     return {
       success: true,
+      message: 'Token renovado',
       data: {
-        opciones,
-        permisos: this.flattenOpciones(opciones),
+        access_token:  accessToken,
+        refresh_token: newRefreshToken,
+        expires_in:    this.config.get<string>('JWT_EXPIRES_IN', '4h'),
+        token_type:    'Bearer',
+        session_id:    payload.sessionId,
       },
     };
   }
@@ -141,16 +202,16 @@ export class AuthService {
         this.macCache.delete(user.sessionId);
       } catch (macErr: any) {
         await this.kafkaLogger.log({
-          event_type: 'LOGOUT', level: 'WARN', trace_id: context?.traceId,
-          user_id: user.sub, username: user.username, session_id: user.sessionId,
-          action: 'LOGOUT', outcome: 'MAC_ERROR', reason: macErr?.message,
+          eventType: 'LOGOUT', level: 'WARN', traceId: context?.traceId,
+          userId: user.sub, username: user.username, sessionId: user.sessionId,
+          action: 'LOGOUT', outcome: 'MAC_ERROR', payload: { reason: macErr?.message },
         });
       }
     }
 
     await this.kafkaLogger.log({
-      event_type: 'LOGOUT', level: 'INFO', trace_id: context?.traceId,
-      user_id: user.sub, username: user.username, session_id: user.sessionId,
+      eventType: 'LOGOUT', level: 'INFO', traceId: context?.traceId,
+      userId: user.sub, username: user.username, sessionId: user.sessionId,
       action: 'LOGOUT', outcome: 'SUCCESS',
     });
 
@@ -161,13 +222,18 @@ export class AuthService {
   async cambiarContrasena(user: any, actualContrasena: string, nuevaContrasena: string) {
     const cached = this.macCache.get(user.sessionId);
     if (!cached) throw new UnauthorizedException('Sesión MAC no encontrada o expirada');
-    const result = await this.macDao.cambiarContrasena(cached.macToken, user.username, actualContrasena, nuevaContrasena);
-    await this.kafkaLogger.log({
-      event_type: 'PASSWORD_CHANGE', level: 'INFO',
-      user_id: user.sub, username: user.username, session_id: user.sessionId,
-      action: 'PASSWORD_CHANGE', outcome: 'SUCCESS',
-    });
-    return result;
+    try {
+      const result = await this.macDao.cambiarContrasena(cached.macToken, user.username, actualContrasena, nuevaContrasena);
+      await this.kafkaLogger.log({
+        eventType: 'PASSWORD_CHANGE', level: 'INFO',
+        userId: user.sub, username: user.username, sessionId: user.sessionId,
+        action: 'PASSWORD_CHANGE', outcome: 'SUCCESS',
+      });
+      return result;
+    } catch (err) {
+      if (err instanceof MacTokenExpiredException) this.macCache.delete(user.sessionId);
+      throw err;
+    }
   }
 
   async validateToken(token: string) {

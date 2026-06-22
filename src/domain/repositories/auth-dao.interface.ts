@@ -1,4 +1,4 @@
-import type { UserInfo } from './user-info.interface';
+import type { UserInfo } from '../models/user-info.interface';
 
 /**
  * AUTH_DAO — token para IAuthDao (validación de credenciales).

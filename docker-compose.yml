@@ -1,4 +1,4 @@
-# docker-compose.yml — aa-pruebas-auth (producción)
+# docker-compose.yml — ms-cnl-cross-auth-profile (producción)
 # Uso: docker compose up -d
 #
 # Los secretos se cargan desde Vault al arrancar.
@@ -6,22 +6,28 @@
 # Actualizar .env.docker cuando se regeneren tokens con vault-init.
 
 services:
-  aa-pruebas-auth:
+  ms-cnl-cross-auth-profile:
     build: .
     env_file:
       - .env.docker
     ports:
-      - "10402:10402"
+      - "10701:10701"
+      - "20701:20701"
     environment:
       NODE_ENV: production
-      PORT: "10402"
+      PORT: "10701"
       VAULT_ADDR: "http://host.docker.internal:8200"
-      VAULT_SECRET_PATH: "hce/nestjs/auth-service"
+      VAULT_SECRET_PATH: "hce/nestjs/cnl-cross-auth-profile"
+      USE_SSL: "true"
+      CERT_PATH: "/proyectos/certs"
+      SSL_PORT: "20701"
+    volumes:
+      - /proyectos/certs:/proyectos/certs:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:10402/auth/health || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://localhost:10701/auth/health || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3

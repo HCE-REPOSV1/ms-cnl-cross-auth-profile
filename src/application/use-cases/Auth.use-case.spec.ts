@@ -1,9 +1,9 @@
 import { UnauthorizedException }  from '@nestjs/common';
 import { JwtService }             from '@nestjs/jwt';
 import { ConfigService }          from '@nestjs/config';
-import { AuthService }            from './auth.service';
-import { MacTokenCacheService }   from './mac-token-cache.service';
-import { IAuthDao, IMacAuthDao }  from './auth-dao.interface';
+import { AuthUseCase }            from './Auth.use-case';
+import { MacTokenCacheService }   from '../../infrastructure/cache/mac-token-cache.service';
+import { IAuthDao, IMacAuthDao }  from '../../domain/repositories/auth-dao.interface';
 import { KafkaLoggerService }     from '../../logger/kafka-logger.service';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -55,13 +55,13 @@ function makeService(overrides: {
   const cache   = overrides.cache   ?? makeCache();
   const kafka   = makeKafka();
 
-  const svc = new AuthService(jwt, cfg, authDao, macDao, cache, kafka);
+  const svc = new AuthUseCase(jwt, cfg, authDao, macDao, cache, kafka);
   return { svc, jwt, authDao, macDao, cache, kafka };
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-describe('AuthService', () => {
+describe('AuthUseCase', () => {
 
   describe('login()', () => {
     it('login exitoso → firma JWT y almacena mac_token en cache', async () => {

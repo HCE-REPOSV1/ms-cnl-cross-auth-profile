@@ -7,6 +7,12 @@ if [ -n "${VAULT_TOKEN:-}" ] && [ -n "${VAULT_SECRET_PATH:-}" ]; then
   VAULT_URL="${VAULT_ADDR:-http://localhost:8200}"
   CLEAN_PATH="${VAULT_SECRET_PATH#secret/data/}"
 
+  # Renovar el token antes de leer (best-effort, no interrumpe el arranque)
+  wget -qO- \
+    --header "X-Vault-Token: ${VAULT_TOKEN}" \
+    --post-data '' \
+    "${VAULT_URL}/v1/auth/token/renew-self" > /dev/null 2>&1 || true
+
   VAULT_JSON=$(wget -qO- \
     --header "X-Vault-Token: ${VAULT_TOKEN}" \
     "${VAULT_URL}/v1/secret/data/${CLEAN_PATH}") || {

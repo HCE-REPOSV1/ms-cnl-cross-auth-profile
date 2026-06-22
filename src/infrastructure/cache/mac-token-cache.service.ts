@@ -13,7 +13,7 @@ interface CacheEntry {
  *
  * Para escalar a múltiples instancias: reemplazar `Map` por un cliente Redis
  * inyectado vía un módulo de cache (ej: @nestjs/cache-manager con ioredis).
- * La interfaz de set/get/delete no cambia → AuthService no requiere modificación.
+ * La interfaz de set/get/delete no cambia → AuthUseCase no requiere modificación.
  */
 @Injectable()
 export class MacTokenCacheService {
