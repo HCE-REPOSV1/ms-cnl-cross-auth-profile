@@ -9,9 +9,13 @@ services:
     build: .
     ports:
       - "${PORT:-10701}:${PORT:-10701}"
+      - "${SSL_PORT:-20701}:${SSL_PORT:-20701}"
     env_file: .env
     environment:
       NODE_ENV: development
+    volumes:
+      # Certificado autofirmado de prueba (generado con openssl, nunca commiteado — ver .gitignore)
+      - ./certs-dev:/app/certs:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
