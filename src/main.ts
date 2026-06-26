@@ -1,4 +1,4 @@
-import { NestFactory }    from '@nestjs/core';
+﻿import { NestFactory }    from '@nestjs/core';
 import { ValidationPipe, VersioningType } from '@nestjs/common';
 import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import { AppModule }      from './app.module';
@@ -6,6 +6,7 @@ import * as http  from 'http';
 import * as https from 'https';
 import * as cookieParser from 'cookie-parser';
 import { buildHttpsOptions } from './ssl/ssl-config.util';
+import { GlobalExceptionFilter } from './filters/global-exception.filter';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, { logger: ['log', 'warn', 'error', 'debug'] });
@@ -15,6 +16,7 @@ async function bootstrap() {
   // esa conversión — este servicio (el único que la usa) necesita leerla directamente.
   app.use(cookieParser());
   app.useGlobalPipes(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }));
+  app.useGlobalFilters(new GlobalExceptionFilter());
 
   app.setGlobalPrefix('api', { exclude: ['health'] });
   app.enableVersioning({ type: VersioningType.URI, defaultVersion: '1', prefix: 'v' });

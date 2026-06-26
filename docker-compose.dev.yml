@@ -15,7 +15,7 @@ services:
       NODE_ENV: development
     volumes:
       # Certificado autofirmado de prueba (generado con openssl, nunca commiteado — ver .gitignore)
-      - ./certs-dev:/app/certs:ro
+      - ${CERTS_HOST_PATH:-../certs-dev}:/app/certs:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped

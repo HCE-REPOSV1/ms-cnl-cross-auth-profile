@@ -1,8 +1,8 @@
-# Dockerfile — auth-pruebas-auth (Auth Service)
+﻿# Dockerfile â€” auth-pruebas-auth (Auth Service)
 FROM node:20-alpine AS builder
 WORKDIR /app
 COPY package*.json ./
-RUN npm ci
+RUN npm install
 COPY . .
 RUN npm run build
 
@@ -11,7 +11,7 @@ WORKDIR /app
 ENV NODE_ENV=production
 RUN addgroup -S nestjs && adduser -S nestjs -G nestjs
 COPY package*.json ./
-RUN npm ci --only=production
+RUN npm install --omit=dev
 COPY --from=builder /app/dist ./dist
 COPY entrypoint.sh ./entrypoint.sh
 RUN chmod +x entrypoint.sh

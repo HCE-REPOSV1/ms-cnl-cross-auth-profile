@@ -1,4 +1,4 @@
-# docker-compose.yml — ms-cnl-cross-auth-profile (producción)
+﻿# docker-compose.yml — ms-cnl-cross-auth-profile (producción)
 # Uso: docker compose up -d
 #
 # Los secretos se cargan desde Vault al arrancar.
@@ -18,9 +18,6 @@ services:
       PORT: "10701"
       VAULT_ADDR: "http://host.docker.internal:8200"
       VAULT_SECRET_PATH: "hce/nestjs/cnl-cross-auth-profile"
-      USE_SSL: "true"
-      CERT_PATH: "/proyectos/certs"
-      SSL_PORT: "20701"
     volumes:
       - /proyectos/certs:/proyectos/certs:ro
     extra_hosts:
