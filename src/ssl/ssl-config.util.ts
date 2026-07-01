@@ -78,6 +78,24 @@ function logPfxInfo(pfxPath: string, passphrase?: string): void {
   }
 }
 
+// ─── Agente HTTPS de salida para llamadas a otros MS con certificado autofirmado ──
+// Los MS internos comparten el mismo certificado de desarrollo (certs-dev/dev.crt).
+// En vez de deshabilitar la verificación TLS (rejectUnauthorized: false), se agrega
+// ese certificado a la lista de CAs de confianza: sigue validando la cadena, solo
+// que ahora reconoce este certificado autofirmado como válido.
+export function buildOutboundHttpsAgent(): https.Agent | undefined {
+  const certsPath = process.env.CERT_PATH || '/app/certs';
+  const certInfo = detectCertFormat(certsPath);
+  if (!certInfo || certInfo.type !== 'pem') return undefined;
+
+  try {
+    const devCert = fs.readFileSync(certInfo.cert!);
+    return new https.Agent({ ca: [...tls.rootCertificates.map(c => Buffer.from(c)), devCert] });
+  } catch {
+    return undefined;
+  }
+}
+
 export function buildHttpsOptions(): https.ServerOptions | null {
   if (process.env.USE_SSL !== 'true') return null;
 

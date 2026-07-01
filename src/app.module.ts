@@ -12,6 +12,7 @@ import { ExternalAuthDao } from './infrastructure/persistence/external-auth.dao'
 import { MacTokenCacheService } from './infrastructure/cache/mac-token-cache.service';
 import { JwtAuthGuard } from './infrastructure/guards/jwt-auth.guard';
 import { AUTH_DAO, MAC_DAO } from './domain/repositories/auth-dao.interface';
+import { buildOutboundHttpsAgent } from './ssl/ssl-config.util';
 
 @Module({
   imports: [
@@ -29,6 +30,7 @@ import { AUTH_DAO, MAC_DAO } from './domain/repositories/auth-dao.interface';
       imports:    [ConfigModule],
       useFactory: (cfg: ConfigService) => ({
         timeout: Number(cfg.get<string>('EXTERNAL_AUTH_TIMEOUT_MS', '5000')),
+        httpsAgent: buildOutboundHttpsAgent(),
       }),
       inject: [ConfigService],
     }),
