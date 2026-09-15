@@ -72,7 +72,7 @@ export class AuthController {
       ip:        (req.headers['x-forwarded-for'] as string) ?? req.ip,
       userAgent: req.headers['user-agent'],
       traceId:   req.headers['x-trace-id'] as string,
-    });
+    }, body.forceLogout ?? false);
     this.setCookies(res, result.data.access_token, result.data.refresh_token);
     const { refresh_token, ...data } = result.data;
     return { ...result, data };

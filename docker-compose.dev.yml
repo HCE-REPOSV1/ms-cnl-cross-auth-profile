@@ -19,6 +19,23 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
+    depends_on:
+      - redis
+
+  # Sesion unica por usuario (HU01 "Multiples sesiones abiertas") + cache server-side del
+  # mac_token, indexados por sessionId — ver MacTokenCacheService. Primer consumidor de
+  # Redis en todo HCE_BACK; propio de este servicio (no un Redis compartido en un compose
+  # raiz), mismo criterio ya usado para infra puntual de otros servicios (ej. cdc-kafka en
+  # ms-cnl-int-hce-integration). Sin password en dev (mismo criterio que Kafka sin SASL en
+  # este proyecto) -- en produccion, REDIS_PASSWORD es obligatorio (Vault).
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis-auth-profile-data:/data
+
+volumes:
+  redis-auth-profile-data:
 
 networks:
   default:

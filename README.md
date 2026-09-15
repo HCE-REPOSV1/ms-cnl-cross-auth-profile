@@ -11,7 +11,7 @@ Todas las rutas reales van con el prefijo de versión del API Gateway: `/api/v1/
 
 | Método | Ruta | Protección | Descripción |
 |--------|------|------------|-------------|
-| POST | `/auth/login` | Público | Login contra MAC. Emite `access_token` (cookie httpOnly + body) y `refresh_token` (cookie httpOnly **only**, nunca en el body) |
+| POST | `/auth/login` | Público | Login contra MAC. Emite `access_token` (cookie httpOnly + body) y `refresh_token` (cookie httpOnly **only**, nunca en el body). Rechaza con `409` (`{codigo:'SESION_ACTIVA', mensaje}`) si el usuario ya tiene una sesión activa (HU01) — reintentar con `forceLogout: true` en el body para desalojarla y continuar |
 | POST | `/auth/refresh` | Cookie `refresh_token` | Renueva `access_token` a partir de la cookie `refresh_token` y **rota ambos** tokens (emite uno nuevo de cada). No revalida contra MAC: si la sesión MAC ya expiró, `/auth/accesos` y `/auth/cambiar-contrasena` seguirán fallando hasta un login real |
 | POST | `/auth/validate` | Público | Valida un JWT (`access_token`) — usado internamente por el API Gateway |
 | GET  | `/auth/health` | Público | Health check |
@@ -37,6 +37,32 @@ Todas las rutas reales van con el prefijo de versión del API Gateway: `/api/v1/
 casos donde un gateway interno lo necesita como `Authorization: Bearer <token>` explícito
 (ver `gateway.service.ts` de los API Gateways). `refresh_token` **nunca** aparece en ningún
 body de respuesta — solo existe como cookie httpOnly, para que JS del browser no pueda leerlo.
+
+### Sesión única por usuario (HU01 "Múltiples sesiones abiertas")
+
+`AuthUseCase.login()` reserva de forma atómica (Redis `SET NX`, ver `MacTokenCacheService.
+trySetActiveSession()`) un índice `username -> sessionId` antes de emitir la sesión nueva.
+Si el usuario ya tiene una sesión activa (en otra pestaña, navegador o dispositivo), el
+login normal responde `409` con:
+
+```json
+{ "codigo": "SESION_ACTIVA", "mensaje": "Ya existe una sesión abierta con este usuario. Si desea iniciar sesión aquí, asegúrese de haber cerrado correctamente su sesión en cualquier otra ventana o dispositivo." }
+```
+
+El front muestra ese mensaje con dos opciones:
+- **Cancelar** — no hace nada más, vuelve a la pantalla de login.
+- **Cerrar Sesión** — reintenta el mismo `POST /auth/login` agregando `forceLogout: true` al
+  body. Ese segundo intento cierra la sesión anterior (best-effort contra MAC vía
+  `POST /cerrarSesion` con el `mac_token` viejo, y en el cache local) y recién ahí emite la
+  sesión nueva sin volver a chequear.
+
+Requiere Redis (`REDIS_HOST`/`REDIS_PORT`/`REDIS_PASSWORD`/`REDIS_DB`, ver `.env.example`)
+para escalar más allá de una sola instancia de este servicio — un cache en memoria de
+proceso no detectaría una sesión creada en otra réplica. Si Redis no está disponible, el
+login **no se bloquea**: se degrada con gracia (se omite el chequeo de sesión única) y queda
+un `WARN` en el audit log (Kafka, `eventType: LOGIN_SESSION_CACHE_UNAVAILABLE`) — un
+problema de infraestructura no debe convertirse en un login bloqueado, pero tampoco en un
+bypass silencioso de esta regla de negocio.
 
 ## JWT Payload
 

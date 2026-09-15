@@ -10,6 +10,7 @@ import { AuthUseCase } from './application/use-cases/Auth.use-case';
 import { AuthController } from './infrastructure/controllers/Auth.controller';
 import { ExternalAuthDao } from './infrastructure/persistence/external-auth.dao';
 import { MacTokenCacheService } from './infrastructure/cache/mac-token-cache.service';
+import { REDIS_CLIENT, createRedisClient } from './infrastructure/cache/redis-client.provider';
 import { JwtAuthGuard } from './infrastructure/guards/jwt-auth.guard';
 import { AUTH_DAO, MAC_DAO } from './domain/repositories/auth-dao.interface';
 import { buildOutboundHttpsAgent } from './ssl/ssl-config.util';
@@ -41,6 +42,7 @@ import { buildOutboundHttpsAgent } from './ssl/ssl-config.util';
     AuthUseCase,
     ExternalAuthDao,
     MacTokenCacheService,
+    { provide: REDIS_CLIENT, useFactory: createRedisClient, inject: [ConfigService] },
     JwtAuthGuard,
     { provide: AUTH_DAO, useClass: ExternalAuthDao },
     { provide: MAC_DAO,  useClass: ExternalAuthDao },

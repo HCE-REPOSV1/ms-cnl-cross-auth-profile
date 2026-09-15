@@ -1,4 +1,4 @@
-import { Injectable, UnauthorizedException, HttpException, Inject } from '@nestjs/common';
+import { Injectable, UnauthorizedException, HttpException, Inject, Logger } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import { randomUUID } from 'crypto';
@@ -6,9 +6,12 @@ import { AUTH_DAO, IAuthDao, MAC_DAO, IMacAuthDao } from '../../domain/repositor
 import { MacTokenCacheService } from '../../infrastructure/cache/mac-token-cache.service';
 import { KafkaLoggerService } from '../../logger/kafka-logger.service';
 import { MacTokenExpiredException } from '../../domain/exceptions/mac-token-expired.exception';
+import { ActiveSessionExistsException } from '../../domain/exceptions/active-session-exists.exception';
 
 @Injectable()
 export class AuthUseCase {
+  private readonly logger = new Logger(AuthUseCase.name);
+
   constructor(
     private readonly jwt:         JwtService,
     private readonly config:      ConfigService,
@@ -18,7 +21,12 @@ export class AuthUseCase {
     private readonly kafkaLogger: KafkaLoggerService,
   ) {}
 
-  async login(username: string, password: string, context?: { ip?: string; userAgent?: string; traceId?: string }) {
+  async login(
+    username: string,
+    password: string,
+    context?: { ip?: string; userAgent?: string; traceId?: string },
+    forceLogout = false,
+  ) {
     const attemptTraceId = context?.traceId ?? randomUUID();
 
     try {
@@ -37,7 +45,7 @@ export class AuthUseCase {
 
       // mac_token almacenado en caché server-side — nunca en el JWT
       if (user.macToken) {
-        this.macCache.set(sessionId, user.macToken, user.perfil ?? '');
+        await this.enforceSingleSession(sessionId, user, forceLogout, attemptTraceId, context);
       }
 
       const payload = {
@@ -87,12 +95,15 @@ export class AuthUseCase {
       // en vez de retornar null — por eso el logging debe hacerse aquí, no en el
       // branch `if (!user)` de arriba (que en la práctica nunca se alcanza).
       if (err instanceof HttpException) {
-        const status   = err.getStatus();
-        const blocked   = status === 403;
-        const reason    = (err.getResponse() as any)?.mensaje ?? err.message;
+        const status         = err.getStatus();
+        const blocked        = status === 403;
+        const activeSession  = err instanceof ActiveSessionExistsException;
+        const reason         = (err.getResponse() as any)?.mensaje ?? err.message;
         await this.kafkaLogger.log({
-          eventType: blocked ? 'LOGIN_BLOCKED' : 'LOGIN_FAILED', level: 'WARN', traceId: attemptTraceId,
-          username, action: 'LOGIN', outcome: blocked ? 'BLOCKED' : 'FAILED', payload: { reason },
+          eventType: activeSession ? 'LOGIN_BLOCKED_ACTIVE_SESSION' : blocked ? 'LOGIN_BLOCKED' : 'LOGIN_FAILED',
+          level: 'WARN', traceId: attemptTraceId,
+          username, action: 'LOGIN', outcome: activeSession ? 'ACTIVE_SESSION' : blocked ? 'BLOCKED' : 'FAILED',
+          payload: { reason },
           ipAddress: context?.ip, userAgent: context?.userAgent,
         });
         throw err;
@@ -103,6 +114,68 @@ export class AuthUseCase {
         ipAddress: context?.ip, userAgent: context?.userAgent,
       });
       throw err;
+    }
+  }
+
+  /**
+   * HU01 "Multiples sesiones abiertas". Dos caminos:
+   *
+   * - forceLogout=false (default, primer intento de login): reserva el indice
+   *   username->sessionId de forma atomica (trySetActiveSession, SET NX) — si ya habia una
+   *   sesion activa, lanza ActiveSessionExistsException (409) SIN tocar nada mas. El front
+   *   muestra el mensaje de la HU con las opciones "Cerrar Sesión"/"Cancelar".
+   * - forceLogout=true (el usuario ya confirmo "Cerrar Sesión"): cierra la sesion activa
+   *   anterior — best-effort contra MAC (POST /cerrarSesion con el mac_token viejo) y en el
+   *   cache local — y recien ahi escribe la sesion nueva sin chequeo (ya no hay carrera que
+   *   proteger, el usuario pidio explicitamente desalojar).
+   *
+   * Fallos de Redis (cache no disponible) NO tumban el login — se loguean como WARN via
+   * Kafka (visibles en auditoria) y se deja pasar sin chequeo de sesion unica, a proposito:
+   * un problema de infraestructura no debe convertirse en un login bloqueado, pero tampoco
+   * debe ser un bypass silencioso de una regla de negocio explicita del cliente.
+   */
+  private async enforceSingleSession(
+    sessionId: string,
+    user: { username: string; macToken?: string; perfil?: string },
+    forceLogout: boolean,
+    traceId: string,
+    context?: { ip?: string; userAgent?: string },
+  ): Promise<void> {
+    if (!user.macToken) return;
+
+    try {
+      if (forceLogout) {
+        const previous = await this.macCache.closeUserSession(user.username);
+        if (previous?.macToken) {
+          try {
+            await this.macDao.cerrarSesion(previous.macToken, user.username);
+          } catch (macErr: any) {
+            // Best-effort: si MAC ya invalido ese token por su cuenta (ej. expiro), no
+            // debe bloquear el login nuevo — solo se deja rastro en auditoria.
+            await this.kafkaLogger.log({
+              eventType: 'LOGIN_FORCE_CLOSE_MAC_ERROR', level: 'WARN', traceId,
+              username: user.username, action: 'LOGIN', outcome: 'MAC_ERROR',
+              payload: { reason: macErr?.message },
+              ipAddress: context?.ip, userAgent: context?.userAgent,
+            });
+          }
+        }
+        await this.macCache.set(sessionId, user.macToken, user.perfil ?? '', user.username);
+        return;
+      }
+
+      const reserved = await this.macCache.trySetActiveSession(sessionId, user.macToken, user.perfil ?? '', user.username);
+      if (!reserved) throw new ActiveSessionExistsException();
+    } catch (err) {
+      if (err instanceof ActiveSessionExistsException) throw err;
+      // Fallo real de Redis (conexion, timeout, etc.) — degradar con gracia, no tumbar el login.
+      this.logger.warn(`MacTokenCacheService no disponible durante login de '${user.username}' — se omite el chequeo de sesión única: ${(err as any)?.message}`);
+      await this.kafkaLogger.log({
+        eventType: 'LOGIN_SESSION_CACHE_UNAVAILABLE', level: 'WARN', traceId,
+        username: user.username, action: 'LOGIN', outcome: 'DEGRADED',
+        payload: { reason: (err as any)?.message },
+        ipAddress: context?.ip, userAgent: context?.userAgent,
+      });
     }
   }
 
@@ -130,7 +203,7 @@ export class AuthUseCase {
 
   /** Recibe el payload ya verificado por JwtAuthGuard */
   async getAccesos(user: any) {
-    const cached = this.macCache.get(user.sessionId);
+    const cached = await this.macCache.get(user.sessionId);
     if (!cached) throw new UnauthorizedException('Sesión MAC no encontrada o expirada');
     try {
       const raw      = await this.macDao.getAccesos(cached.macToken, cached.perfil);
@@ -143,7 +216,7 @@ export class AuthUseCase {
         },
       };
     } catch (err) {
-      if (err instanceof MacTokenExpiredException) this.macCache.delete(user.sessionId);
+      if (err instanceof MacTokenExpiredException) await this.macCache.delete(user.sessionId);
       throw err;
     }
   }
@@ -195,11 +268,11 @@ export class AuthUseCase {
 
   /** Recibe el payload ya verificado por JwtAuthGuard */
   async cerrarSesionMac(user: any, context?: { traceId?: string }) {
-    const cached = this.macCache.get(user.sessionId);
+    const cached = await this.macCache.get(user.sessionId);
     if (cached) {
       try {
         await this.macDao.cerrarSesion(cached.macToken, user.username);
-        this.macCache.delete(user.sessionId);
+        await this.macCache.delete(user.sessionId);
       } catch (macErr: any) {
         await this.kafkaLogger.log({
           eventType: 'LOGOUT', level: 'WARN', traceId: context?.traceId,
@@ -220,7 +293,7 @@ export class AuthUseCase {
 
   /** Recibe el payload ya verificado por JwtAuthGuard */
   async cambiarContrasena(user: any, actualContrasena: string, nuevaContrasena: string) {
-    const cached = this.macCache.get(user.sessionId);
+    const cached = await this.macCache.get(user.sessionId);
     if (!cached) throw new UnauthorizedException('Sesión MAC no encontrada o expirada');
     try {
       const result = await this.macDao.cambiarContrasena(cached.macToken, user.username, actualContrasena, nuevaContrasena);
@@ -231,7 +304,7 @@ export class AuthUseCase {
       });
       return result;
     } catch (err) {
-      if (err instanceof MacTokenExpiredException) this.macCache.delete(user.sessionId);
+      if (err instanceof MacTokenExpiredException) await this.macCache.delete(user.sessionId);
       throw err;
     }
   }

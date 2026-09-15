@@ -5,6 +5,7 @@ import { AuthUseCase }            from './Auth.use-case';
 import { MacTokenCacheService }   from '../../infrastructure/cache/mac-token-cache.service';
 import { IAuthDao, IMacAuthDao }  from '../../domain/repositories/auth-dao.interface';
 import { KafkaLoggerService }     from '../../logger/kafka-logger.service';
+import { ActiveSessionExistsException } from '../../domain/exceptions/active-session-exists.exception';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -33,8 +34,17 @@ function makeMacDao(accesosResult: any = { data: { opciones: [] } }): jest.Mocke
   } as any;
 }
 
+/** trySetActiveSession resuelve true por defecto (sin sesion previa) — mismo default que
+ * un usuario que loguea por primera vez, para no tener que setearlo en cada test existente. */
 function makeCache(): jest.Mocked<MacTokenCacheService> {
-  return { set: jest.fn(), get: jest.fn(), delete: jest.fn() } as any;
+  return {
+    set:                     jest.fn().mockResolvedValue(undefined),
+    get:                     jest.fn().mockResolvedValue(null),
+    delete:                  jest.fn().mockResolvedValue(undefined),
+    trySetActiveSession:     jest.fn().mockResolvedValue(true),
+    getActiveSessionForUser: jest.fn().mockResolvedValue(null),
+    closeUserSession:        jest.fn().mockResolvedValue(null),
+  } as any;
 }
 
 function makeKafka(): jest.Mocked<KafkaLoggerService> {
@@ -59,25 +69,27 @@ function makeService(overrides: {
   return { svc, jwt, authDao, macDao, cache, kafka };
 }
 
+const FULL_USER = {
+  userId: 'u1', username: 'JPEREZ', roles: ['12'], email: 'j@x.com',
+  nombres: 'Juan', apellidoPaterno: 'Pérez', apellidoMaterno: '',
+  nombreCompleto: 'Juan Pérez', nombrePerfil: 'Médico', numeroDocumento: '12345',
+  sucursales: [], idUsuario: '99',
+  macToken: 'mac-tok-xyz', perfil: '12', requirePasswordChange: false,
+};
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe('AuthUseCase', () => {
 
   describe('login()', () => {
-    it('login exitoso → firma JWT y almacena mac_token en cache', async () => {
-      const user = {
-        userId: 'u1', username: 'JPEREZ', roles: ['12'], email: 'j@x.com',
-        nombres: 'Juan', apellidoPaterno: 'Pérez', apellidoMaterno: '',
-        nombreCompleto: 'Juan Pérez', nombrePerfil: 'Médico', numeroDocumento: '12345',
-        sucursales: [], idUsuario: '99',
-        macToken: 'mac-tok-xyz', perfil: '12', requirePasswordChange: false,
-      };
-      const { svc, jwt, cache } = makeService({ authDao: makeAuthDao(user) });
+    it('login exitoso (sin sesion previa) → firma JWT y reserva la sesion activa en cache', async () => {
+      const { svc, jwt, cache } = makeService({ authDao: makeAuthDao(FULL_USER) });
 
       const result = await svc.login('JPEREZ', 'pass123');
 
       expect(jwt.sign).toHaveBeenCalled();
-      expect(cache.set).toHaveBeenCalledWith(expect.any(String), 'mac-tok-xyz', '12');
+      expect(cache.trySetActiveSession).toHaveBeenCalledWith(expect.any(String), 'mac-tok-xyz', '12', 'JPEREZ');
+      expect(cache.set).not.toHaveBeenCalled();
       expect(result.data.access_token).toBe('signed-token');
       expect(result.success).toBe(true);
     });
@@ -87,18 +99,76 @@ describe('AuthUseCase', () => {
       await expect(svc.login('JPEREZ', 'wrong')).rejects.toBeInstanceOf(UnauthorizedException);
     });
 
-    it('sin mac_token → no llama cache.set', async () => {
-      const user = {
-        userId: 'u1', username: 'JPEREZ', roles: [], email: '',
-        nombres: '', apellidoPaterno: '', apellidoMaterno: '',
-        nombreCompleto: '', nombrePerfil: '', numeroDocumento: '',
-        sucursales: [], idUsuario: '',
-        macToken: '',   // sin token MAC
-        perfil: '', requirePasswordChange: false,
-      };
+    it('sin mac_token → no llama a ningun metodo de cache', async () => {
+      const user = { ...FULL_USER, macToken: '' };
       const { svc, cache } = makeService({ authDao: makeAuthDao(user) });
       await svc.login('JPEREZ', 'pass');
       expect(cache.set).not.toHaveBeenCalled();
+      expect(cache.trySetActiveSession).not.toHaveBeenCalled();
+    });
+
+    describe('HU01 "Múltiples sesiones abiertas"', () => {
+      it('ya existe sesion activa (trySetActiveSession=false) → lanza ActiveSessionExistsException, sin firmar JWT', async () => {
+        const cache = makeCache();
+        cache.trySetActiveSession.mockResolvedValue(false);
+        const { svc, jwt } = makeService({ authDao: makeAuthDao(FULL_USER), cache });
+
+        await expect(svc.login('JPEREZ', 'pass123')).rejects.toBeInstanceOf(ActiveSessionExistsException);
+        expect(jwt.sign).not.toHaveBeenCalled();
+      });
+
+      it('forceLogout=true → cierra la sesion previa contra MAC y en cache, y emite la sesion nueva', async () => {
+        const cache = makeCache();
+        cache.closeUserSession.mockResolvedValue({ macToken: 'tok-viejo', sessionId: 'session-vieja' });
+        const macDao = makeMacDao();
+        const { svc, jwt, cache: cacheUsed } = makeService({ authDao: makeAuthDao(FULL_USER), cache, macDao });
+
+        const result = await svc.login('JPEREZ', 'pass123', undefined, true);
+
+        expect(cache.closeUserSession).toHaveBeenCalledWith('JPEREZ');
+        expect(macDao.cerrarSesion).toHaveBeenCalledWith('tok-viejo', 'JPEREZ');
+        expect(cacheUsed.set).toHaveBeenCalledWith(expect.any(String), 'mac-tok-xyz', '12', 'JPEREZ');
+        expect(cache.trySetActiveSession).not.toHaveBeenCalled();
+        expect(jwt.sign).toHaveBeenCalled();
+        expect(result.success).toBe(true);
+      });
+
+      it('forceLogout=true sin sesion previa (closeUserSession=null) → no llama a macDao.cerrarSesion, igual emite la sesion nueva', async () => {
+        const cache = makeCache();
+        cache.closeUserSession.mockResolvedValue(null);
+        const macDao = makeMacDao();
+        const { svc, cache: cacheUsed } = makeService({ authDao: makeAuthDao(FULL_USER), cache, macDao });
+
+        await svc.login('JPEREZ', 'pass123', undefined, true);
+
+        expect(macDao.cerrarSesion).not.toHaveBeenCalled();
+        expect(cacheUsed.set).toHaveBeenCalledWith(expect.any(String), 'mac-tok-xyz', '12', 'JPEREZ');
+      });
+
+      it('forceLogout=true y macDao.cerrarSesion falla → no bloquea el login (best-effort)', async () => {
+        const cache = makeCache();
+        cache.closeUserSession.mockResolvedValue({ macToken: 'tok-viejo', sessionId: 'session-vieja' });
+        const macDao = makeMacDao();
+        macDao.cerrarSesion.mockRejectedValue(new Error('MAC token ya expirado'));
+        const { svc, jwt } = makeService({ authDao: makeAuthDao(FULL_USER), cache, macDao });
+
+        const result = await svc.login('JPEREZ', 'pass123', undefined, true);
+
+        expect(jwt.sign).toHaveBeenCalled();
+        expect(result.success).toBe(true);
+      });
+
+      it('Redis no disponible (trySetActiveSession rechaza) → degrada con gracia, permite el login igual', async () => {
+        const cache = makeCache();
+        cache.trySetActiveSession.mockRejectedValue(new Error('ECONNREFUSED'));
+        const { svc, jwt, kafka } = makeService({ authDao: makeAuthDao(FULL_USER), cache });
+
+        const result = await svc.login('JPEREZ', 'pass123');
+
+        expect(jwt.sign).toHaveBeenCalled();
+        expect(result.success).toBe(true);
+        expect(kafka.log).toHaveBeenCalledWith(expect.objectContaining({ eventType: 'LOGIN_SESSION_CACHE_UNAVAILABLE' }));
+      });
     });
   });
 
@@ -122,14 +192,14 @@ describe('AuthUseCase', () => {
   describe('getAccesos()', () => {
     it('sin entrada en cache → lanza UnauthorizedException', async () => {
       const cache = makeCache();
-      cache.get.mockReturnValue(null);
+      cache.get.mockResolvedValue(null);
       const { svc } = makeService({ cache });
       await expect(svc.getAccesos({ sessionId: 's1' })).rejects.toBeInstanceOf(UnauthorizedException);
     });
 
     it('con cache → llama macDao.getAccesos y retorna opciones + permisos aplanados', async () => {
       const cache = makeCache();
-      cache.get.mockReturnValue({ macToken: 'tok', perfil: '12' });
+      cache.get.mockResolvedValue({ macToken: 'tok', perfil: '12' });
 
       const opciones = [
         { codigo: '01', titulo: 'Módulo A', indicador: 'E', opciones: [
@@ -151,7 +221,7 @@ describe('AuthUseCase', () => {
 
     it('opciones vacías en respuesta MAC → permisos = []', async () => {
       const cache = makeCache();
-      cache.get.mockReturnValue({ macToken: 'tok', perfil: '12' });
+      cache.get.mockResolvedValue({ macToken: 'tok', perfil: '12' });
       const { svc } = makeService({ cache, macDao: makeMacDao({ data: { opciones: [] } }) });
       const result = await svc.getAccesos({ sessionId: 's1' });
       expect(result.data.permisos).toHaveLength(0);
@@ -161,7 +231,7 @@ describe('AuthUseCase', () => {
   describe('flattenOpciones() — via getAccesos', () => {
     async function flatten(opciones: any[]) {
       const cache = makeCache();
-      cache.get.mockReturnValue({ macToken: 't', perfil: 'p' });
+      cache.get.mockResolvedValue({ macToken: 't', perfil: 'p' });
       const macDao = makeMacDao({ data: { opciones } });
       const { svc } = makeService({ cache, macDao });
       return (await svc.getAccesos({ sessionId: 's' })).data.permisos;

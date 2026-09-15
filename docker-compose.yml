@@ -23,11 +23,32 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
+    depends_on:
+      - redis
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:10701/auth/health || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3
+
+  # Sesion unica por usuario (HU01) + cache del mac_token — ver MacTokenCacheService.
+  # A diferencia de docker-compose.dev.yml, NO expone puerto al host (solo accesible dentro
+  # de la red hce-dev) — el mac_token es un credential vivo contra AD, mayor blast-radius
+  # que otra infra puntual de este proyecto que si expone puerto en dev.
+  # REDIS_PASSWORD debe agregarse a Vault (VAULT_SECRET_PATH de arriba) antes de desplegar
+  # esto en produccion — sin password configurado ahi, REDIS_PASSWORD llega vacio y Redis
+  # queda sin auth, aceptable en dev pero no en produccion (ver revision de arquitectura).
+  redis:
+    image: redis:7-alpine
+    command: ["sh", "-c", "redis-server --requirepass \"$$REDIS_PASSWORD\""]
+    env_file:
+      - .env.docker
+    restart: unless-stopped
+    volumes:
+      - redis-auth-profile-data:/data
+
+volumes:
+  redis-auth-profile-data:
 
 networks:
   default:

@@ -1,47 +1,125 @@
-import { Injectable } from '@nestjs/common';
+import { Inject, Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { REDIS_CLIENT, RedisLike } from './redis-client.provider';
 
 interface CacheEntry {
   macToken: string;
   perfil:   string;
-  expiresAt: number;
+  username: string;
 }
 
+const SESSION_PREFIX      = 'authprofile:session:';
+const USER_SESSION_PREFIX = 'authprofile:user-session:';
+
 /**
- * Almacena el mac_token externo en memoria del servidor, indexado por sessionId.
- * El JWT ya NO carga el mac_token — solo viaja el sessionId para buscar aquí.
+ * Almacena el mac_token externo en Redis, indexado por sessionId — server-side, el JWT
+ * nunca carga el mac_token, solo viaja el sessionId para buscar aca (ver AuthUseCase).
  *
- * Para escalar a múltiples instancias: reemplazar `Map` por un cliente Redis
- * inyectado vía un módulo de cache (ej: @nestjs/cache-manager con ioredis).
- * La interfaz de set/get/delete no cambia → AuthUseCase no requiere modificación.
+ * Migrado de un Map en memoria a Redis (2026-09-15) para escalar mas alla de una sola
+ * instancia de este servicio: a medida que crece el nuevo sistema HCE va a haber multiples
+ * logins concurrentes, potencialmente contra replicas distintas detras de un load balancer
+ * -- un Map de proceso no puede detectar que un username ya tiene sesion activa si esa
+ * sesion se creo en OTRA instancia.
+ *
+ * Ademas del cache sessionId -> {macToken, perfil} de siempre, mantiene un INDICE
+ * SECUNDARIO username -> sessionId (HU01 "Multiples sesiones abiertas"): permite que
+ * AuthUseCase.login() detecte una sesion activa existente del mismo usuario ANTES de
+ * emitir un JWT nuevo, y ofrecer forzar el cierre de esa sesion anterior.
  */
 @Injectable()
 export class MacTokenCacheService {
-  private readonly store  = new Map<string, CacheEntry>();
-  private readonly ttlMs: number;
+  private readonly ttlSeconds: number;
 
-  constructor(cfg: ConfigService) {
-    const raw   = cfg.get<string>('JWT_EXPIRES_IN', '4h');
+  constructor(
+    @Inject(REDIS_CLIENT) private readonly redis: RedisLike,
+    cfg: ConfigService,
+  ) {
+    const raw = cfg.get<string>('JWT_EXPIRES_IN', '4h');
     const match = raw.match(/^(\d+)(s|m|h|d)$/);
-    const mult: Record<string, number> = { s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000 };
-    this.ttlMs  = match ? Number(match[1]) * (mult[match[2]] ?? 3_600_000) : 4 * 3_600_000;
+    const multSeconds: Record<string, number> = { s: 1, m: 60, h: 3_600, d: 86_400 };
+    this.ttlSeconds = match ? Number(match[1]) * (multSeconds[match[2]] ?? 3_600) : 4 * 3_600;
   }
 
-  set(sessionId: string, macToken: string, perfil: string): void {
-    this.store.set(sessionId, { macToken, perfil, expiresAt: Date.now() + this.ttlMs });
+  private userKey(username: string): string {
+    return USER_SESSION_PREFIX + username.toUpperCase();
   }
 
-  get(sessionId: string): { macToken: string; perfil: string } | null {
-    const entry = this.store.get(sessionId);
-    if (!entry) return null;
-    if (Date.now() > entry.expiresAt) {
-      this.store.delete(sessionId);
-      return null;
-    }
+  /**
+   * Escribe la entrada de sesion Y el indice username->sessionId con el mismo TTL, SIN
+   * chequear si ya habia una sesion activa — usar solo en el camino "forzado" (forceLogout,
+   * despues de closeUserSession) o cuando el caller ya garantizo por otro medio que no hay
+   * carrera posible. Para el camino normal de login usar trySetActiveSession().
+   */
+  async set(sessionId: string, macToken: string, perfil: string, username: string): Promise<void> {
+    const entry: CacheEntry = { macToken, perfil, username };
+    await this.redis.set(SESSION_PREFIX + sessionId, JSON.stringify(entry), 'EX', this.ttlSeconds);
+    await this.redis.set(this.userKey(username), sessionId, 'EX', this.ttlSeconds);
+  }
+
+  /**
+   * Camino NO forzado de login (HU01 "Multiples sesiones abiertas"): reserva el indice
+   * username->sessionId de forma ATOMICA (SET ... NX) antes de escribir la entrada de
+   * sesion, para cerrar la ventana de carrera entre getActiveSessionForUser() y set()
+   * cuando dos requests de login del mismo usuario llegan casi simultaneas (doble clic,
+   * retry de red) — sin esto, ambas podrian pasar el chequeo previo y crear dos sesiones
+   * "no forzadas" a la vez, rompiendo la garantia que promete la HU.
+   *
+   * Devuelve false sin escribir nada si el indice ya existia (sesion activa detectada) —
+   * el caller debe tratarlo igual que si getActiveSessionForUser() hubiera encontrado una.
+   *
+   * Orden deliberado (user-session con NX primero, session:{sessionId} despues): si el
+   * proceso crashea entre ambas escrituras, el fallo cae del lado PERMISIVO (sessionId
+   * sin indice — se autolimpia solo por TTL) en vez del lado que rompe el invariante de
+   * sesion unica.
+   */
+  async trySetActiveSession(sessionId: string, macToken: string, perfil: string, username: string): Promise<boolean> {
+    const reserved = await this.redis.set(this.userKey(username), sessionId, 'EX', this.ttlSeconds, 'NX');
+    if (reserved !== 'OK') return false;
+
+    const entry: CacheEntry = { macToken, perfil, username };
+    await this.redis.set(SESSION_PREFIX + sessionId, JSON.stringify(entry), 'EX', this.ttlSeconds);
+    return true;
+  }
+
+  async get(sessionId: string): Promise<{ macToken: string; perfil: string } | null> {
+    const raw = await this.redis.get(SESSION_PREFIX + sessionId);
+    if (!raw) return null;
+    const entry: CacheEntry = JSON.parse(raw);
     return { macToken: entry.macToken, perfil: entry.perfil };
   }
 
-  delete(sessionId: string): void {
-    this.store.delete(sessionId);
+  /** Elimina la entrada de sesion y, si existe, su entrada en el indice username->sessionId. */
+  async delete(sessionId: string): Promise<void> {
+    const raw = await this.redis.get(SESSION_PREFIX + sessionId);
+    await this.redis.del(SESSION_PREFIX + sessionId);
+    if (raw) {
+      const entry: CacheEntry = JSON.parse(raw);
+      await this.redis.del(this.userKey(entry.username));
+    }
+  }
+
+  /**
+   * HU01 "Multiples sesiones abiertas": ¿este username ya tiene una sesion activa? Se
+   * llama ANTES de crear una sesion nueva en AuthUseCase.login().
+   */
+  async getActiveSessionForUser(username: string): Promise<string | null> {
+    return this.redis.get(this.userKey(username));
+  }
+
+  /**
+   * Cierra la sesion activa previa de un username (flujo "Cerrar Sesión" de HU01, cuando
+   * el usuario confirma que quiere desalojar su otra sesion). Devuelve el macToken/
+   * sessionId de la sesion cerrada para que el caller pueda invalidarla tambien contra MAC
+   * (POST /cerrarSesion) — null si no habia ninguna sesion activa para ese username.
+   */
+  async closeUserSession(username: string): Promise<{ macToken: string; sessionId: string } | null> {
+    const sessionId = await this.redis.get(this.userKey(username));
+    if (!sessionId) return null;
+
+    const raw = await this.redis.get(SESSION_PREFIX + sessionId);
+    await this.redis.del(SESSION_PREFIX + sessionId);
+    await this.redis.del(this.userKey(username));
+
+    return { macToken: raw ? (JSON.parse(raw) as CacheEntry).macToken : '', sessionId };
   }
 }
