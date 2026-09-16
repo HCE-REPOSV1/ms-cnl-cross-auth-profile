@@ -100,6 +100,37 @@ describe('MacTokenCacheService', () => {
     });
   });
 
+  describe('touch', () => {
+    beforeEach(() => jest.useFakeTimers());
+    afterEach(() => jest.useRealTimers());
+
+    it('extiende el TTL de la sesion y del indice username->sessionId', async () => {
+      const svc = new MacTokenCacheService(new FakeRedis(), makeCfg('1s'));
+      await svc.set('s', 'tok', 'p', 'jperez');
+
+      jest.advanceTimersByTime(900);
+      await svc.touch('s');
+      jest.advanceTimersByTime(900); // total 1800ms desde el set() original — ya habria vencido sin el touch
+
+      await expect(svc.get('s')).resolves.not.toBeNull();
+      await expect(svc.getActiveSessionForUser('jperez')).resolves.toBe('s');
+    });
+
+    it('no revive una entrada que ya vencio (no-op silencioso)', async () => {
+      const svc = new MacTokenCacheService(new FakeRedis(), makeCfg('1s'));
+      await svc.set('s', 'tok', 'p', 'jperez');
+      jest.advanceTimersByTime(1001);
+
+      await expect(svc.touch('s')).resolves.not.toThrow();
+      await expect(svc.get('s')).resolves.toBeNull();
+    });
+
+    it('touch en sessionId inexistente no lanza error', async () => {
+      const svc = new MacTokenCacheService(new FakeRedis(), makeCfg());
+      await expect(svc.touch('no-existe')).resolves.not.toThrow();
+    });
+  });
+
   describe('delete', () => {
     it('elimina la entrada del store', async () => {
       const svc = new MacTokenCacheService(new FakeRedis(), makeCfg());

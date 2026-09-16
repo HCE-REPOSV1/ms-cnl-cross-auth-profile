@@ -41,6 +41,7 @@ function makeCache(): jest.Mocked<MacTokenCacheService> {
     set:                     jest.fn().mockResolvedValue(undefined),
     get:                     jest.fn().mockResolvedValue(null),
     delete:                  jest.fn().mockResolvedValue(undefined),
+    touch:                   jest.fn().mockResolvedValue(undefined),
     trySetActiveSession:     jest.fn().mockResolvedValue(true),
     getActiveSessionForUser: jest.fn().mockResolvedValue(null),
     closeUserSession:        jest.fn().mockResolvedValue(null),
@@ -169,6 +170,66 @@ describe('AuthUseCase', () => {
         expect(result.success).toBe(true);
         expect(kafka.log).toHaveBeenCalledWith(expect.objectContaining({ eventType: 'LOGIN_SESSION_CACHE_UNAVAILABLE' }));
       });
+    });
+  });
+
+  describe('refreshAccessToken()', () => {
+    const REFRESH_PAYLOAD = { sub: 'u1', username: 'JPEREZ', sessionId: 'sess-1', type: 'refresh' };
+
+    it('refresh_token inválido/expirado (jwt.verify lanza) → UnauthorizedException, sin tocar cache', async () => {
+      const jwt = makeJwt();
+      jwt.verify.mockImplementation(() => { throw new Error('jwt expired'); });
+      const { svc, cache } = makeService({ jwt });
+
+      await expect(svc.refreshAccessToken('bad-token')).rejects.toBeInstanceOf(UnauthorizedException);
+      expect(cache.get).not.toHaveBeenCalled();
+    });
+
+    it('token decodificado no es de tipo refresh → UnauthorizedException', async () => {
+      const jwt = makeJwt();
+      jwt.verify.mockReturnValue({ ...REFRESH_PAYLOAD, type: 'access' });
+      const { svc } = makeService({ jwt });
+
+      await expect(svc.refreshAccessToken('some-token')).rejects.toBeInstanceOf(UnauthorizedException);
+    });
+
+    it('sesion viva en macCache → renueva JWT y extiende el TTL (touch)', async () => {
+      const jwt = makeJwt();
+      jwt.verify.mockReturnValue(REFRESH_PAYLOAD);
+      const cache = makeCache();
+      cache.get.mockResolvedValue({ macToken: 'mac-tok-xyz', perfil: '12' });
+      const { svc } = makeService({ jwt, cache });
+
+      const result = await svc.refreshAccessToken('good-refresh-token');
+
+      expect(cache.get).toHaveBeenCalledWith('sess-1');
+      expect(cache.touch).toHaveBeenCalledWith('sess-1');
+      expect(result.success).toBe(true);
+      expect(result.data.access_token).toBe('signed-token');
+    });
+
+    it('sesion ya no existe en macCache (TTL vencido o borrada por MacTokenExpiredException) → rechaza el refresh, fuerza login nuevo', async () => {
+      const jwt = makeJwt();
+      jwt.verify.mockReturnValue(REFRESH_PAYLOAD);
+      const cache = makeCache();
+      cache.get.mockResolvedValue(null);
+      const { svc } = makeService({ jwt, cache });
+
+      await expect(svc.refreshAccessToken('good-refresh-token')).rejects.toBeInstanceOf(UnauthorizedException);
+      expect(cache.touch).not.toHaveBeenCalled();
+    });
+
+    it('Redis no disponible (macCache.get rechaza) → degrada con gracia, permite el refresh igual', async () => {
+      const jwt = makeJwt();
+      jwt.verify.mockReturnValue(REFRESH_PAYLOAD);
+      const cache = makeCache();
+      cache.get.mockRejectedValue(new Error('ECONNREFUSED'));
+      const { svc } = makeService({ jwt, cache });
+
+      const result = await svc.refreshAccessToken('good-refresh-token');
+
+      expect(result.success).toBe(true);
+      expect(cache.touch).not.toHaveBeenCalled();
     });
   });
 

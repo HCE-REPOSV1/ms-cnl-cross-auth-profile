@@ -99,6 +99,31 @@ export class MacTokenCacheService {
   }
 
   /**
+   * Extiende el TTL de la entrada de sesion y de su indice username->sessionId — llamado
+   * desde AuthUseCase.refreshAccessToken() en CADA /auth/refresh exitoso.
+   *
+   * Laguna que esto cierra: el TTL se fijaba UNA sola vez en el login (set/
+   * trySetActiveSession) y nunca se tocaba de nuevo — una sesion mantenida viva a punta de
+   * refresh (hasta 7d via JWT_REFRESH_EXPIRES_IN) perdia su entrada en macCache a las
+   * JWT_EXPIRES_IN horas igual (ej. 4h), sin importar que el usuario siguiera activo. Efecto
+   * doble: getAccesos/cambiarContrasena empezaban a fallar a mitad de sesion, Y el indice de
+   * sesion unica (HU01) desaparecia, permitiendo un segundo login sin el 409 aunque la
+   * sesion original siguiera "viva" del lado del JWT.
+   *
+   * No-op silencioso si la entrada ya no existe (sesion MAC ya vencida/limpiada por otro
+   * camino, ej. delete() tras MacTokenExpiredException) — el refresh del JWT sigue
+   * funcionando iguel, pero accesos/cambiarContrasena seguiran fallando hasta un login
+   * nuevo, exactamente como ya esta documentado para ese caso.
+   */
+  async touch(sessionId: string): Promise<void> {
+    const raw = await this.redis.get(SESSION_PREFIX + sessionId);
+    if (!raw) return;
+    const entry: CacheEntry = JSON.parse(raw);
+    await this.redis.set(SESSION_PREFIX + sessionId, raw, 'EX', this.ttlSeconds);
+    await this.redis.set(this.userKey(entry.username), sessionId, 'EX', this.ttlSeconds);
+  }
+
+  /**
    * HU01 "Multiples sesiones abiertas": ¿este username ya tiene una sesion activa? Se
    * llama ANTES de crear una sesion nueva en AuthUseCase.login().
    */

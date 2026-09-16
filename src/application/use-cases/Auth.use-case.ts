@@ -237,8 +237,17 @@ export class AuthUseCase {
 
   /**
    * Reemite access_token + refresh_token (rotación) a partir de un refresh_token válido.
-   * No revalida contra MAC ni extiende el macCache — si la sesión MAC ya expiró,
-   * getAccesos/cambiarContrasena seguirán fallando hasta un login nuevo (ver diseño en memoria).
+   *
+   * Gate de sesión (cierra la laguna "TTL de Redis fijo desde el login, nunca se extendía
+   * con refresh"): la vigencia de la sesión HCE queda atada a que la entrada en macCache
+   * siga viva — esa entrada es la ÚNICA fuente de verdad de "sesión HCE activa" (a MAC no
+   * le importa si hay N sesiones simultáneas del mismo usuario, la exclusividad de HU01 es
+   * una garantía que vive enteramente de este lado). Si ya se detectó que el mac_token
+   * venció (getAccesos → MacTokenExpiredException → macCache.delete()) o el TTL natural
+   * expiró sin que nadie lo extendiera, el refresh se RECHAZA — fuerza un login nuevo en
+   * vez de permitir una sesión HCE indefinidamente renovable sobre una sesión MAC ya
+   * muerta. Si la entrada SÍ existe, se extiende su TTL (touch) junto con el JWT: una
+   * sesión en uso activo se mantiene viva completa mientras se la siga refrescando.
    */
   async refreshAccessToken(refreshToken: string) {
     let decoded: any;
@@ -250,6 +259,11 @@ export class AuthUseCase {
     if (decoded?.type !== 'refresh') throw new UnauthorizedException('Token no es de tipo refresh');
 
     const { type, iat, exp, ...payload } = decoded;
+
+    if (payload.sessionId) {
+      await this.enforceSessionStillAlive(payload.sessionId);
+    }
+
     const accessToken     = this.jwt.sign(payload);
     const newRefreshToken = this.signRefreshToken(payload);
 
@@ -264,6 +278,28 @@ export class AuthUseCase {
         session_id:    payload.sessionId,
       },
     };
+  }
+
+  /**
+   * Gate de refresh (ver doc de refreshAccessToken). Un fallo de INFRAESTRUCTURA de Redis
+   * (no "la key no existe", sino que Redis no responde) se degrada con gracia igual que en
+   * login — no tumba el refresh por un problema ajeno a la sesión del usuario.
+   */
+  private async enforceSessionStillAlive(sessionId: string): Promise<void> {
+    let cached: { macToken: string; perfil: string } | null;
+    try {
+      cached = await this.macCache.get(sessionId);
+    } catch (err: any) {
+      this.logger.warn(`MacTokenCacheService no disponible durante refresh de sessionId='${sessionId}' — se omite el chequeo de sesión, se permite el refresh igual: ${err?.message}`);
+      return;
+    }
+    if (!cached) throw new UnauthorizedException('Sesión expirada, vuelve a iniciar sesión');
+
+    try {
+      await this.macCache.touch(sessionId);
+    } catch (err: any) {
+      this.logger.warn(`No se pudo extender el TTL de macCache para sessionId='${sessionId}': ${err?.message}`);
+    }
   }
 
   /** Recibe el payload ya verificado por JwtAuthGuard */
