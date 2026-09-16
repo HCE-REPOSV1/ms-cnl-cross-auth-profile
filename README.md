@@ -193,6 +193,38 @@ docker compose -f docker-compose.dev.yml up -d --build
 docker compose -f docker-compose.dev.yml down
 ```
 
+### Actualizar el contenedor sin tumbar sesiones activas
+
+`docker compose down` para TODOS los servicios del compose, incluido `redis`
+— no solo el que cambiaste. Redis persiste su dataset en el volumen nombrado
+`redis-auth-profile-data` y por defecto hace un `SAVE` síncrono al recibir
+`SIGTERM` (`save 3600 1 300 100 60 10000` es la config de persistencia por
+defecto de la imagen), así que un `down` sin `-v` seguido de `up -d --build`
+**probablemente** no pierde las sesiones activas — pero es una garantía
+implícita, no algo que el comando asegure: depende de que Redis alcance a
+completar el `SAVE` dentro del tiempo de gracia (`docker stop`, 10s por
+defecto) antes de que Docker lo mate.
+
+La forma robusta de actualizar SOLO el código de este servicio, sin apagar
+Redis en absoluto:
+
+```bash
+docker compose -f docker-compose.dev.yml build ms-cnl-cross-auth-profile
+docker compose -f docker-compose.dev.yml up -d --force-recreate ms-cnl-cross-auth-profile
+```
+
+Esto reconstruye y recrea únicamente el contenedor de la app — Redis sigue
+corriendo sin interrupción, cero riesgo de perder `authprofile:session:*` /
+`authprofile:user-session:*` durante el deploy. Esto es especialmente
+relevante desde que `POST /auth/refresh` quedó atado a que esa entrada en
+Redis siga viva (ver "Sesión única por usuario" más arriba): si Redis se cae
+aunque sea un instante durante un `down`/`up` completo, cualquier usuario que
+intente refrescar su token justo en esa ventana pierde la sesión de HCE por
+completo, no solo el acceso a `/auth/accesos`.
+
+Usa el `down` completo solo cuando de verdad quieras reiniciar Redis desde
+cero (por ejemplo, para invalidar todas las sesiones activas a propósito).
+
 ### Producción (con Vault)
 
 El `docker-compose.yml` lee los secretos directamente de Vault al arrancar. **No se necesita `.env`.**
